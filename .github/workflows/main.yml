@@ -44,7 +44,13 @@ jobs:
           version: latest
           run_install: false
 
-      # Install dependencies using pnpm (Removed redundant pnpm add dotenv)
+      # Force pnpm to hoist dependencies to fix ESM resolution issues
+      - name: Configure pnpm hoisting
+        run: |
+          cd source_repo
+          echo "shamefully-hoist=true" >> .npmrc
+
+      # Install dependencies using pnpm
       - name: Install dependencies
         run: |
           cd source_repo
