@@ -1,129 +1,216 @@
+
 name: Build and Release
 
 on:
   push:
-    branches: [ main ]
+    branches:
+      - main
+
   pull_request:
-    branches: [ main ]
+    branches:
+      - main
+
   schedule:
     - cron: '14 8 */3 * *'
+
+  workflow_dispatch:
+
+# GitHub Actions permissions
+permissions:
+  contents: write
+
+# Prevent overlapping release jobs
+concurrency:
+  group: rsshub-build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
   build:
     runs-on: ubuntu-latest
 
     steps:
-      # Install GitHub CLI
-      - name: Install GitHub CLI
-        run: sudo apt install gh
-
-      # Checkout the source repository
-      - name: Checkout source repository
+      # Checkout RSSHub source repository
+      - name: Checkout RSSHub source
         uses: actions/checkout@v4
         with:
           repository: DIYgod/RSSHub
           path: source_repo
+          fetch-depth: 1
 
       # Checkout your own repository
-      - name: Checkout your repository
+      - name: Checkout build repository
         uses: actions/checkout@v4
         with:
           path: rsshub_build
-          token: ${{ secrets.GITHUB_TOKEN }}
+          fetch-depth: 0
+          persist-credentials: true
 
-      # Set up Node.js
+      # Set up Node.js 24
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '22.x'
+          node-version: '24.x'
 
-      # Install pnpm using official action
+      # Install pnpm
       - name: Install pnpm
-        uses: pnpm/action-setup@v3
-        with:
-          version: latest
-          run_install: false
-
-      # Force pnpm to hoist dependencies to fix ESM resolution issues
-      - name: Configure pnpm hoisting
         run: |
-          cd source_repo
-          echo "shamefully-hoist=true" >> .npmrc
+          npm install -g pnpm@12.18.0
 
-      # Install dependencies using pnpm
+      # Display build environment
+      - name: Check build environment
+        run: |
+          echo "Node.js version:"
+          node -v
+
+          echo "pnpm version:"
+          pnpm -v
+
+          echo "RSSHub package manager:"
+          node -p "require('./source_repo/package.json').packageManager"
+
+          echo "RSSHub source commit:"
+          cd source_repo
+          git rev-parse HEAD
+
+      # Install dependencies
       - name: Install dependencies
         run: |
           cd source_repo
-          pnpm install
+          pnpm install --frozen-lockfile
 
-      # Build project using pnpm
-      - name: Build project
+      # Check Notion SDK exports
+      - name: Check Notion SDK
+        run: |
+          cd source_repo
+          node --input-type=module -e "
+            import('@notionhq/client').then(m => {
+              console.log('Client:', typeof m.Client);
+              console.log('APIErrorCode:', typeof m.APIErrorCode);
+              console.log('isFullPage:', typeof m.isFullPage);
+              console.log('isNotionClientError:', typeof m.isNotionClientError);
+
+              if (
+                typeof m.Client !== 'function' ||
+                typeof m.isFullPage !== 'function' ||
+                typeof m.isNotionClientError !== 'function'
+              ) {
+                process.exit(1);
+              }
+            }).catch(err => {
+              console.error(err);
+              process.exit(1);
+            });
+          "
+
+      # Build RSSHub
+      - name: Build RSSHub
         run: |
           cd source_repo
           pnpm run build
 
-      # Zip the build directory
-      - name: Zip the build directory
-        run: |
-          cd source_repo
-          tar zcvf ../rsshub_build/build.tar.gz ./*
-
-      # Configure Git
-      - name: Configure Git
-        run: |
-          cd rsshub_build
-          git config --global user.name 'github-actions[bot]'
-          git config --global user.email 'github-actions[bot]@users.noreply.github.com'
-
-      # Get the current commit SHA of the source repository and shorten it
-      - name: Get source repo commit SHA
+      # Get source commit SHA
+      - name: Get source commit SHA
         id: get_source_sha
         run: |
           cd source_repo
-          SOURCE_SHA=$(git rev-parse --short=10 HEAD)
-          echo "SOURCE_SHA=$SOURCE_SHA" >> $GITHUB_OUTPUT
 
-      # Delete existing tag and release if they exist
-      - name: Delete existing tag and release
+          SOURCE_SHA=$(git rev-parse HEAD)
+          SHORT_SHA=$(git rev-parse --short=10 HEAD)
+
+          echo "SOURCE_SHA=$SOURCE_SHA" >> "$GITHUB_OUTPUT"
+          echo "SHORT_SHA=$SHORT_SHA" >> "$GITHUB_OUTPUT"
+
+          echo "Source commit: $SOURCE_SHA"
+
+      # Package build directory
+      - name: Package RSSHub
+        run: |
+          cd source_repo
+
+          tar czf ../rsshub_build/build.tar.gz \
+            --exclude='.git' \
+            .
+
+          echo "Build archive:"
+          ls -lh ../rsshub_build/build.tar.gz
+
+      # Configure Git
+      - name: Configure Git
+        if: github.event_name != 'pull_request'
+        run: |
+          cd rsshub_build
+
+          git config user.name "github-actions[bot]"
+          git config user.email \
+            "41898282+github-actions[bot]@users.noreply.github.com"
+
+      # Delete previous release and tag
+      - name: Delete previous Release and Tag
+        if: github.event_name != 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          TAG_NAME="latest"
           cd rsshub_build
-          echo "Fetching tags from origin"
-          git fetch --tags
-          echo "Attempting to delete local tag $TAG_NAME"
-          git tag -d $TAG_NAME || true
-          echo "Attempting to delete remote tag $TAG_NAME"
-          git push origin :refs/tags/$TAG_NAME || true
-          
-          # Get all releases with the tag 'latest'
-          RELEASE_IDS=$(gh api "repos/${{ github.repository }}/releases" -q '.[] | select(.tag_name == "latest") | .id')
-          
-          # Delete all found releases with the tag 'latest'
-          for RELEASE_ID in $RELEASE_IDS; do
-            if [ -n "$RELEASE_ID" ]; then
-              echo "Deleting release with ID $RELEASE_ID"
-              gh api "repos/${{ github.repository }}/releases/$RELEASE_ID" -X DELETE
-            fi
-          done
 
-      # Create Git tag using the shortened source repository commit SHA
+          TAG_NAME="latest"
+
+          echo "Checking existing release..."
+
+          if gh release view "$TAG_NAME" \
+            --repo "${{ github.repository }}" >/dev/null 2>&1; then
+
+            echo "Deleting existing release..."
+
+            gh release delete "$TAG_NAME" \
+              --repo "${{ github.repository }}" \
+              --yes
+          fi
+
+          echo "Deleting existing remote tag..."
+
+          git push origin ":refs/tags/$TAG_NAME" || true
+
+          echo "Previous release cleanup completed."
+
+      # Create Git tag
       - name: Create Git tag
         id: create_tag
+        if: github.event_name != 'pull_request'
         run: |
           cd rsshub_build
-          TAG_NAME="latest"
-          git tag $TAG_NAME
-          git push origin $TAG_NAME
-          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
 
-      # Upload to GitHub Releases
-      - name: Upload to GitHub Releases
-        uses: softprops/action-gh-release@v1
+          TAG_NAME="latest"
+
+          git tag -f "$TAG_NAME"
+
+          git push origin "$TAG_NAME"
+
+          echo "TAG_NAME=$TAG_NAME" >> "$GITHUB_OUTPUT"
+
+          echo "Created tag: $TAG_NAME"
+
+      # Publish GitHub Release
+      - name: Publish GitHub Release
+        if: github.event_name != 'pull_request'
+        uses: softprops/action-gh-release@v2
         with:
+          repository: ${{ github.repository }}
           files: rsshub_build/build.tar.gz
           tag_name: ${{ steps.create_tag.outputs.TAG_NAME }}
-          body: "Source repository commit: https://github.com/DIYgod/RSSHub/tree/${{ steps.get_source_sha.outputs.SOURCE_SHA }}"
+          name: RSSHub Latest Build
+          body: |
+            Automatically built from the latest DIYgod/RSSHub source.
+
+            Source commit:
+            https://github.com/DIYgod/RSSHub/commit/${{ steps.get_source_sha.outputs.SOURCE_SHA }}
+
+            Source SHA:
+            ${{ steps.get_source_sha.outputs.SOURCE_SHA }}
+
+            Node.js: 24.x
+            pnpm: 12.18.0
+
+          make_latest: true
+          fail_on_unmatched_files: true
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
