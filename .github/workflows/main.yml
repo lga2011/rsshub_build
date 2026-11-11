@@ -19,14 +19,14 @@ jobs:
 
       # Checkout the source repository
       - name: Checkout source repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           repository: DIYgod/RSSHub
           path: source_repo
 
       # Checkout your own repository
       - name: Checkout your repository
-        uses: actions/checkout@v2
+        uses: actions/checkout@v4
         with:
           path: rsshub_build
           token: ${{ secrets.GITHUB_TOKEN }}
@@ -37,21 +37,18 @@ jobs:
         with:
           node-version: '22.x'
 
-      # Install pnpm
+      # Install pnpm using official action
       - name: Install pnpm
-        run: npm install -g pnpm
+        uses: pnpm/action-setup@v3
+        with:
+          version: latest
+          run_install: false
 
-      # Install dependencies using pnpm
+      # Install dependencies using pnpm (Removed redundant pnpm add dotenv)
       - name: Install dependencies
         run: |
           cd source_repo
           pnpm install
-
-      # Install dotenv using pnpm
-      - name: Install dotenv
-        run: |
-          cd source_repo
-          pnpm add dotenv
 
       # Build project using pnpm
       - name: Build project
@@ -78,17 +75,17 @@ jobs:
         run: |
           cd source_repo
           SOURCE_SHA=$(git rev-parse --short=10 HEAD)
-          echo "::set-output name=SOURCE_SHA::$SOURCE_SHA"
+          echo "SOURCE_SHA=$SOURCE_SHA" >> $GITHUB_OUTPUT
 
       # Delete existing tag and release if they exist
       - name: Delete existing tag and release
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}  # setup GH_TOKEN
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           TAG_NAME="latest"
           cd rsshub_build
           echo "Fetching tags from origin"
-          git fetch --tags  # Fetch latest tags
+          git fetch --tags
           echo "Attempting to delete local tag $TAG_NAME"
           git tag -d $TAG_NAME || true
           echo "Attempting to delete remote tag $TAG_NAME"
@@ -113,7 +110,7 @@ jobs:
           TAG_NAME="latest"
           git tag $TAG_NAME
           git push origin $TAG_NAME
-          echo "::set-output name=TAG_NAME::$TAG_NAME"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_OUTPUT
 
       # Upload to GitHub Releases
       - name: Upload to GitHub Releases
